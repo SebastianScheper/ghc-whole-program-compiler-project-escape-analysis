@@ -18,22 +18,29 @@ import Data.Maybe
 import Data.List (partition, isSuffixOf)
 import Data.Set (Set)
 import Data.Map (Map)
+import Data.Graph (Graph)
 import qualified Data.Map.Strict as StrictMap
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Data.IntMap as IntMap
+import qualified Data.IntSet as IntSet
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Internal as BS
+import qualified Data.Graph as Graph
 import System.Posix.DynamicLinker
 
 import System.FilePath
 import System.IO
 import System.Directory
 
+import Text.Printf
+
 import Stg.Syntax
 import Stg.Program
 import Stg.JSON
 import Stg.Analysis.LiveVariable
+import Stg.Analysis.Escape
+import Stg.Pretty
 
 import Stg.Interpreter.Base
 import Stg.Interpreter.PrimCall
@@ -419,6 +426,10 @@ evalDebugFrame result = \case
 
   x -> error $ "unsupported debug-frame: " ++ show x ++ ", result: " ++ show result
 
+seqList :: [a] -> b -> b
+seqList [] b = b
+seqList (x:xs) b = x `seq` seqList xs b
+
 evalExpr :: HasCallStack => Env -> Expr -> M [Atom]
 evalExpr localEnv = \case
   StgTick _ e       -> evalExpr localEnv e
@@ -437,16 +448,26 @@ evalExpr localEnv = \case
 
   StgLet b e -> do
     extendedEnv <- declareBinding False localEnv b
-    evalExpr extendedEnv e
+    markBindingAlive extendedEnv b
+    res <- evalExpr extendedEnv e
+    res `seqList` markBindingDead extendedEnv b
+    return res
 
   StgLetNoEscape b e -> do -- TODO: do not allocate closure on heap, instead put into env (stack) allocated closure ; model stack allocated heap objects
     extendedEnv <- declareBinding True localEnv b
-    evalExpr extendedEnv e
+    captureBindingAlive extendedEnv b
+    markBindingAlive extendedEnv b
+    res <- evalExpr extendedEnv e
+    res `seqList` markBindingDead extendedEnv b
+    restoreBindingAlive extendedEnv b
+    return res
 
   -- var (join id)
   StgApp i [] _t _
     | JoinId 0 <- binderDetails i
     -> do
+      restoreAlive localEnv i
+
       -- HINT: join id-s are always closures, needs eval
       -- NOTE: join id's type tells the closure return value representation
       (so, v) <- lookupEnvSO localEnv i
@@ -483,6 +504,7 @@ evalExpr localEnv = \case
     -> do
       args <- mapM (evalArg localEnv) l
       (so, v) <- lookupEnvSO localEnv i
+      --restoreAlive i
       builtinStgApply so v args
 
   {- non-join id -}
@@ -498,8 +520,24 @@ evalExpr localEnv = \case
     Just curClosure <- gets ssCurrentClosure
     curClosureAddr <- gets ssCurrentClosureAddr
     stackPush (CaseOf curClosureAddr curClosure localEnv scrutineeResult altType alts)
+    formerThreads <- gets ssThreads
+    threadId <- gets ssCurrentThreadId
     setProgramPoint . PP_Scrutinee $ Id scrutineeResult
-    evalExpr localEnv e
+    let formerStack = tsStack (formerThreads IntMap.! threadId)
+        formerStackSize = length formerStack
+        evalToCase result = do
+          threads <- gets ssThreads
+          let stack = tsStack (threads IntMap.! threadId)
+              stackSize = length stack
+              evalToCase' result = do
+                stackPop >>= \case
+                  Just stackCont@(CaseOf _ _ _ scrt _ _) | scrt == scrutineeResult -> evalStackContinuation result stackCont
+                  Just stackCont -> evalStackContinuation result stackCont >>= evalToCase'
+                  Nothing -> error "Sholdn't happen"
+          if formerStackSize > 0 && stackSize >= formerStackSize && stack !! (stackSize - formerStackSize) == head formerStack
+          then evalToCase' result
+          else return result
+    evalExpr localEnv e >>= evalToCase
 
   StgOpApp (StgPrimOp op) l t tc -> do
     Debugger.checkBreakpoint op
@@ -631,6 +669,9 @@ declareTopBindings mods = do
   -- set the top level binder env
   modify' $ \s@StgState{..} -> s {ssStaticGlobalEnv = Map.fromList $ stringEnv ++ closureEnv}
 
+  globalEnv <- gets ssStaticGlobalEnv
+  (markAlive globalEnv . fst) `mapM_` bindings
+
   -- HINT: top level closures does not capture local variables
   forM_ rhsList $ \(b, addr, rhs) -> storeRhs False mempty b addr rhs
 
@@ -646,8 +687,15 @@ loadAndRunProgram switchCWD fullpak_name progArgs dbgChan dbgState tracing = do
 
 runProgram :: HasCallStack => Bool -> String -> [Module] -> [String] -> DebuggerChan -> DebugState -> Bool -> IO ()
 runProgram switchCWD progFilePath mods0 progArgs dbgChan dbgState tracing = do
-  let mods      = map annotateWithLiveVariables $ extStgRtsSupportModule : mods0 -- NOTE: add RTS support module
+  let mods      = orderedRegardingDependencies (map annotateWithLiveVariables $ extStgRtsSupportModule : mods0) -- NOTE: add RTS support module
       progName  = dropExtension progFilePath
+
+  let doEscapeAnalysis (esc, env) mod = do
+        putStrLn $ "module: " ++ (show . getModuleName . moduleName) mod
+        let (esc', env') = escapeAnalysis env mod
+        putStrLn $ "    escaping binders" ++ show (Set.map binderUniqueName esc')
+        return (esc `Set.union` esc', env')
+  (escAnalysis, _) <- foldM doEscapeAnalysis (Set.empty, emptyEscapeEnv) mods
 
   currentDir <- liftIO getCurrentDirectory
   stgappDir <- makeAbsolute $ takeDirectory progFilePath
@@ -679,6 +727,8 @@ runProgram switchCWD progFilePath mods0 progArgs dbgChan dbgState tracing = do
         -- TODO: do everything that 'hs_exit_' does
 
         exportCallGraph
+
+        exportEscapeStats escAnalysis
 
         -- HINT: start debugger REPL in debug mode
         when (dbgState == DbgStepByStep) $ do
@@ -713,11 +763,30 @@ runProgram switchCWD progFilePath mods0 progArgs dbgChan dbgState tracing = do
     when switchCWD $ setCurrentDirectory currentDir
     freeResources
 
+    let canAllocOnStack = ssBindersDefined `Set.difference` escAnalysis
+        escapedBinders = ssBindersEscaped `Set.difference` escAnalysis
+        onHeapDidn'tEscape = (ssBindersDefined `Set.difference` ssBindersEscaped) `Set.difference` canAllocOnStack
+        (heapAllocBinders, stackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b escAnalysis) ssBinderAllocs
+        (heapAllocs, heapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) heapAllocBinders
+        (stackAllocs, stackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) stackAllocBinders
+
+        (minHeapAllocBinders, maxStackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b ssBindersEscaped) ssBinderAllocs
+        (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
+        (maxStackAllocs, maxStackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) maxStackAllocBinders
+
     putStrLn $ "ssHeapStartAddress: " ++ show ssHeapStartAddress
     putStrLn $ "ssTotalLNECount: " ++ show ssTotalLNECount
     putStrLn $ "ssClosureCallCounter: " ++ show ssClosureCallCounter
     putStrLn $ "executed closure id count: " ++ show (Set.size ssExecutedClosureIds)
     putStrLn $ "call graph size: " ++ show (StrictMap.size . cgInterClosureCallGraph $ ssCallGraph)
+    putStrLn $ "binders to allocate on heap: " ++ show (Set.size escAnalysis)
+    putStrLn $ "binders to allocate on stack: " ++ show (Set.size canAllocOnStack) -- ++ "): " ++ show (Set.map binderUniqueName canAllocOnStack)
+    putStrLn $ "binders on stack escaped: " ++ show (Set.size escapedBinders) -- ++ "): " ++ show (Set.map binderUniqueName escapedBinders)
+    putStrLn $ "binders on heap didn't escape: " ++ show (Set.size onHeapDidn'tEscape) -- ++ "): " ++ show (Set.map binderUniqueName onHeapDidn'tEscape)
+    putStrLn $ "heap allocations: " ++ show heapAllocs ++ " (" ++ show heapAllocsBytes ++ " Bytes)"
+    printf     "stack allocations: %d (%d Bytes, %.2f%%)\n" stackAllocs stackAllocsBytes (100 * (fromIntegral stackAllocsBytes :: Double) / (fromIntegral stackAllocsBytes + fromIntegral heapAllocsBytes))
+    putStrLn $ "lower bound heap allocations: " ++ show minHeapAllocs ++ " (" ++ show minHeapAllocsBytes ++ " Bytes)"
+    printf     "upper bound stack allocations: %d (%d Bytes, %.2f%%)\n" maxStackAllocs maxStackAllocsBytes (100 * (fromIntegral maxStackAllocsBytes :: Double) / (fromIntegral maxStackAllocsBytes + fromIntegral minHeapAllocsBytes))
     --putStrLn $ unlines $ [BS8.unpack $ binderUniqueName b | Id b <- Map.keys ssEnv]
     --print ssNextHeapAddr
     --print $ head $ Map.toList ssEnv
@@ -726,6 +795,12 @@ runProgram switchCWD progFilePath mods0 progArgs dbgChan dbgState tracing = do
 -------------------------
 
 -------------------------
+
+orderedRegardingDependencies :: [Module] -> [Module]
+orderedRegardingDependencies mods = (map ((\ (m, _, _) -> m) . nodeFromVertex) . Graph.topSort . Graph.transposeG) graph
+  where
+    (graph, nodeFromVertex) = Graph.graphFromEdges' (map nodeFromModule mods)
+    nodeFromModule m = (m, moduleName m, concatMap snd (moduleDependency m))
 
 flushStdHandles :: M ()
 flushStdHandles = do

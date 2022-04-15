@@ -184,3 +184,46 @@ writeCallGraphSummary fname CallGraph{..} = do
       , printf "sum: %d" cgSum
       , printf "size (edge count): %d" cgSize
       ]
+
+exportEscapeStats :: Set.Set Binder -> M ()
+exportEscapeStats escAnalysis = do
+  StgState{..} <- get
+  let canAllocOnStack = ssBindersDefined `Set.difference` escAnalysis
+      onHeapDidn'tEscape = (ssBindersDefined `Set.difference` ssBindersEscaped) `Set.difference` canAllocOnStack
+      escapedBinders = ssBindersEscaped `Set.difference` escAnalysis
+      (heapAllocBinders, stackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b escAnalysis) ssBinderAllocs
+      (heapAllocs, heapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) heapAllocBinders
+      (stackAllocs, stackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) stackAllocBinders
+
+      (minHeapAllocBinders, maxStackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b ssBindersEscaped) ssBinderAllocs
+      (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
+      (maxStackAllocs, maxStackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) maxStackAllocBinders
+  liftIO $ withFile (rtsProgName ssRtsSupport ++ "-escape-stats.tsv") WriteMode $ \ h -> do
+    hPutStr h `mapM_` [takeBaseName (rtsProgName ssRtsSupport)
+        , "\t", show (Set.size escAnalysis)
+        , "\t", show (Set.size canAllocOnStack)
+        , "\t", show (Set.size escapedBinders)
+        , "\t", show (Set.size onHeapDidn'tEscape)
+        , "\t", show heapAllocs
+        , "\t", show heapAllocsBytes
+        , "\t", show stackAllocs
+        , "\t", show stackAllocsBytes
+        , "\t", show minHeapAllocs
+        , "\t", show minHeapAllocsBytes
+        , "\t", show maxStackAllocs
+        , "\t", show maxStackAllocsBytes
+        , "\n"
+      ]
+
+  return ()
+
+{-
+    putStrLn $ "escaping binders: " ++ show (Set.size escAnalysis)
+    putStrLn $ "can be allocated on stack (" ++ show (Set.size canAllocOnStack) ++ "): " ++ show canAllocOnStack
+    putStrLn $ "binders on stack escaped (" ++ show (Set.size escapedBinders) ++ "): " ++ show (Set.map binderUniqueName escapedBinders)
+    putStrLn $ "didn't escape: " ++ show (Set.size (ssBindersDefined `Set.difference` escapedBinders))
+    putStrLn $ "heap allocations: " ++ show heapAllocs ++ " (" ++ show heapAllocsBytes ++ " Bytes)"
+    printf     "stack allocations: %d (%d Bytes, %.2f%%)\n" stackAllocs stackAllocsBytes (100 * (fromIntegral stackAllocsBytes :: Double) / (fromIntegral stackAllocsBytes + fromIntegral heapAllocsBytes))
+    putStrLn $ "lower bound heap allocations: " ++ show minHeapAllocs ++ " (" ++ show minHeapAllocsBytes ++ " Bytes)"
+    printf     "upper bound stack allocations: %d (%d Bytes, %.2f%%)\n" maxStackAllocs maxStackAllocsBytes (100 * (fromIntegral maxStackAllocsBytes :: Double) / (fromIntegral maxStackAllocsBytes + fromIntegral minHeapAllocsBytes))
+-}

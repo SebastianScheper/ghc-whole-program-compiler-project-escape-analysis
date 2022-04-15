@@ -29,7 +29,7 @@ compiler:     ghc-8.11.0.20200527
 # use local GHC (for development)
 system-ghc: true
 extra-path:
-  - /home/csaba/haskell/grin-compiler/ghc-whole-program-compiler-project/ghc-wpc/_build/stage1/bin
+  - /home/sebastian/Projekte/ext-stg-interpreter-presentation-demos/ghc-whole-program-compiler-project/ghc-wpc/_build/stage1/bin
 
 # DEBUG INFO
 #dump-logs: all

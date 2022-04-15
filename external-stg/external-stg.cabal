@@ -24,6 +24,7 @@ library
     Stg.JSON
     Stg.Analysis.LiveVariable
     Stg.Analysis.Closure
+    Stg.Analysis.Escape
   hs-source-dirs:      lib
   ghc-options:         -Wall
   cpp-options:         -DEXTERNAL_STG_PACKAGE

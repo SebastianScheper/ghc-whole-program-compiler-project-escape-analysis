@@ -32,6 +32,9 @@ import GHC.Stack
 import Text.Printf
 import Debug.Trace
 import Stg.Syntax
+import GHC.IO.Exception (stackOverflow)
+
+import Data.Maybe
 
 type StgRhsClosure = Rhs  -- NOTE: must be StgRhsClosure only!
 
@@ -330,6 +333,12 @@ data StgState
   , ssExecutedPrimCalls   :: !(Set PrimCall)
   , ssHeapStartAddress    :: !Int
   , ssClosureCallCounter  :: !Int
+  , ssBindersDefined      :: Set Binder
+  , ssBindersAlive        :: Map Binder (Set Addr)
+  , ssBindersEscaped      :: Set Binder
+  , ssBindersAliveAt      :: Map Addr (Map Binder (Set Addr))
+  , ssBoundTo             :: IntMap Binder
+  , ssBinderAllocs        :: Map Binder (Int, Int)
 
   -- call graph
   , ssCallGraph           :: !CallGraph
@@ -448,6 +457,12 @@ emptyStgState stateStore dl dbgChan nextDbgCmd dbgState tracingState gcIn gcOut 
   , ssExecutedPrimCalls   = Set.empty
   , ssHeapStartAddress    = 0
   , ssClosureCallCounter  = 0
+  , ssBindersDefined      = Set.empty
+  , ssBindersAlive        = Map.empty
+  , ssBindersEscaped      = Set.empty
+  , ssBindersAliveAt      = Map.empty
+  , ssBoundTo             = IntMap.empty
+  , ssBinderAllocs        = Map.empty
 
   -- call graph
   , ssCallGraph           = emptyCallGraph
@@ -645,7 +660,8 @@ lookupEnvSO localEnv b
           else pure localEnv
   case Map.lookup (Id b) env of
     Nothing -> stgErrorM $ "unknown variable: " ++ show b
-    Just a  -> pure a
+    Just a  -> do
+      pure a
 
 lookupEnv :: HasCallStack => Env -> Binder -> M Atom
 lookupEnv localEnv b = snd <$> lookupEnvSO localEnv b
@@ -655,7 +671,9 @@ readHeap (HeapPtr l) = do
   h <- gets ssHeap
   case IntMap.lookup l h of
     Nothing -> stgErrorM $ "unknown heap address: " ++ show l
-    Just o  -> pure o
+    Just o  -> do
+      markEscaped l
+      pure o
 readHeap v = error $ "readHeap: could not read heap object: " ++ show v
 
 readHeapCon :: HasCallStack => Atom -> M HeapObject
@@ -777,6 +795,11 @@ setInsert a s
   | Set.member a s  = s
   | otherwise       = Set.insert a s
 
+setDelete :: Ord a => a -> Set a -> Set a
+setDelete a s
+  | Set.member a s  = Set.delete a s
+  | otherwise       = s
+
 markClosure :: Name -> M ()
 markClosure n = modify' $ \s@StgState{..} -> s {ssEvaluatedClosures = setInsert n ssEvaluatedClosures}
 
@@ -794,6 +817,103 @@ markFFI i = modify' $ \s@StgState{..} -> s {ssExecutedFFI = setInsert i ssExecut
 
 markPrimCall :: PrimCall -> M ()
 markPrimCall i = modify' $ \s@StgState{..} -> s {ssExecutedPrimCalls = setInsert i ssExecutedPrimCalls}
+
+atomSize :: Atom -> Int
+atomSize _ = 8
+continuationSize :: StackContinuation -> Int
+continuationSize _ = 8
+
+heapObjSize :: HeapObject -> Int
+heapObjSize Con{ hoConArgs = args } = foldl (+) 8 (map atomSize args)
+heapObjSize Closure{ hoCloArgs = args } = foldl (+) 8 (map atomSize args)
+heapObjSize BlackHole{} = 8
+
+-- header (8) + size (8) + fun (8) + payload
+heapObjSize ApStack{ hoStack = stack } = error "not implemented"--foldl (+) 24 (map continuationSize stack)
+
+markBindingAlive :: Env -> Binding -> M ()
+markBindingAlive env bind = case bind of
+  (StgNonRec b _) -> markAlive env b
+  (StgRec bs) -> mapM_ (markAlive env . fst) bs
+
+markAlive :: Env -> Binder -> M ()
+markAlive env i = do
+  HeapPtr addr <- lookupEnv env i
+  bindersAlive <- gets ssBindersAlive
+
+  let allocated = Map.lookup i bindersAlive
+
+  case allocated of
+    Just addrs -> do
+      modify' $ \s@StgState{..} -> s {ssBindersAlive = Map.insert i (Set.insert addr addrs) ssBindersAlive}
+    Nothing -> do
+      modify' $ \s@StgState{..} -> s {ssBindersAlive = Map.insert i (Set.singleton addr) ssBindersAlive}
+      modify' $ \s@StgState{..} -> s {ssBindersDefined = setInsert i ssBindersDefined}
+
+  bindersPointTo <- gets ssBoundTo
+
+  when (IntMap.notMember addr bindersPointTo) $
+    modify' $ \s@StgState{..} -> s {ssBoundTo = IntMap.insert addr i ssBoundTo}
+
+  binderAllocs <- gets ssBinderAllocs
+  h <- gets ssHeap
+
+  case (Map.lookup i binderAllocs, IntMap.lookup addr h) of
+    (Just (n, bytes), Just obj) -> modify' $ \s@StgState{..} -> s {ssBinderAllocs = Map.insert i (n + 1, bytes + heapObjSize obj) ssBinderAllocs}
+    (Nothing, Just obj) -> modify' $ \s@StgState{..} -> s {ssBinderAllocs = Map.insert i (1, heapObjSize obj) ssBinderAllocs}
+    _ -> return ()
+
+markBindingDead :: Env -> Binding -> M ()
+markBindingDead env bind = case bind of
+  (StgNonRec b _) -> markDead b
+  (StgRec bs) -> mapM_ (markDead . fst) bs
+  where
+    markDead :: Binder -> M ()
+    markDead i = do
+      HeapPtr addr <- lookupEnv env i
+      bindersAlive <- gets ssBindersAlive
+      case Map.lookup i bindersAlive of
+        Just allocs -> do
+          modify' $ \s@StgState{..} -> s {ssBindersAlive = Map.insert i (Set.delete addr allocs) ssBindersAlive}
+        _ -> return ()
+      modify' $ \s@StgState{..} -> s {ssBindersAliveAt = Map.delete addr ssBindersAliveAt}
+
+captureBindingAlive :: Env -> Binding -> M ()
+captureBindingAlive env bind = case bind of
+  (StgNonRec b _) -> captureAlive b
+  (StgRec bs) -> mapM_ (captureAlive . fst) bs
+  where
+    captureAlive :: Binder -> M ()
+    captureAlive i = do
+      HeapPtr addr <- lookupEnv env i
+      modify' $ \s@StgState{..} -> s {ssBindersAliveAt = Map.insert addr ssBindersAlive ssBindersAliveAt}
+
+restoreBindingAlive :: Env -> Binding -> M ()
+restoreBindingAlive env bind = case bind of
+  (StgNonRec b _) -> restoreAlive env b
+  (StgRec bs) -> mapM_ (restoreAlive env . fst) bs
+
+restoreAlive :: Env -> Binder -> M ()
+restoreAlive env i = do
+  StgState{..} <- get
+  HeapPtr addr <- lookupEnv env i
+  case Map.lookup addr ssBindersAliveAt of
+    Just bindersAlive -> do
+      modify' $ \s@StgState{..} -> s {ssBindersAlive = bindersAlive}
+    _ -> return ()
+
+
+markEscaped :: Addr -> M ()
+markEscaped addr = do
+  StgState{..} <- get
+  case IntMap.lookup addr ssBoundTo of
+    Just b ->
+      case Map.lookup b ssBindersAlive of
+        Just allocated -> unless (Set.member addr allocated) $
+          modify' $ \s@StgState{..} -> s {ssBindersEscaped = setInsert b ssBindersEscaped}
+        _ -> return ()
+    _ -> return ()
+  --liftIO $ putStrLn $ show (binderUniqueName b) ++ " referred"
 
 -- call graph
 -- HINT: build separate call graph for each region

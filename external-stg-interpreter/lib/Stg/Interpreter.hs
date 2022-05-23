@@ -15,7 +15,7 @@ import Control.Exception
 import qualified Data.Primitive.ByteArray as BA
 
 import Data.Maybe
-import Data.List (partition, isSuffixOf)
+import Data.List (partition, isSuffixOf, sortOn)
 import Data.Set (Set)
 import Data.Map (Map)
 import Data.Graph (Graph)
@@ -455,11 +455,11 @@ evalExpr localEnv = \case
 
   StgLetNoEscape b e -> do -- TODO: do not allocate closure on heap, instead put into env (stack) allocated closure ; model stack allocated heap objects
     extendedEnv <- declareBinding True localEnv b
-    captureBindingAlive extendedEnv b
     markBindingAlive extendedEnv b
+    captureBindingAlive extendedEnv b
     res <- evalExpr extendedEnv e
-    res `seqList` markBindingDead extendedEnv b
     restoreBindingAlive extendedEnv b
+    res `seqList` markBindingDead extendedEnv b
     return res
 
   -- var (join id)
@@ -504,7 +504,7 @@ evalExpr localEnv = \case
     -> do
       args <- mapM (evalArg localEnv) l
       (so, v) <- lookupEnvSO localEnv i
-      --restoreAlive i
+      restoreAlive localEnv i
       builtinStgApply so v args
 
   {- non-join id -}
@@ -763,30 +763,38 @@ runProgram switchCWD progFilePath mods0 progArgs dbgChan dbgState tracing = do
     when switchCWD $ setCurrentDirectory currentDir
     freeResources
 
-    let canAllocOnStack = ssBindersDefined `Set.difference` escAnalysis
-        escapedBinders = ssBindersEscaped `Set.difference` escAnalysis
-        onHeapDidn'tEscape = (ssBindersDefined `Set.difference` ssBindersEscaped) `Set.difference` canAllocOnStack
+    let allocOnStack = ssBindersDefined `Set.difference` escAnalysis
+        allocOnHeap = ssBindersDefined `Set.intersection` escAnalysis
+        canAllocOnStack = ssBindersDefined `Set.difference` ssBindersEscaped
+        mustAllocOnHeap = ssBindersEscaped
+        onHeapDidn'tEscape = canAllocOnStack `Set.difference` allocOnStack
+        onStackEscaped = mustAllocOnHeap `Set.difference` allocOnHeap
+
         (heapAllocBinders, stackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b escAnalysis) ssBinderAllocs
         (heapAllocs, heapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) heapAllocBinders
         (stackAllocs, stackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) stackAllocBinders
-
+    
         (minHeapAllocBinders, maxStackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b ssBindersEscaped) ssBinderAllocs
-        (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
         (maxStackAllocs, maxStackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) maxStackAllocBinders
+        (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
+
+        onHeapDidn'tEscapeBytes = (sortOn (snd . snd) . Map.toList . Map.mapKeys binderUniqueName . Map.filterWithKey (\ b _ -> Set.member b onHeapDidn'tEscape)) ssBinderAllocs
 
     putStrLn $ "ssHeapStartAddress: " ++ show ssHeapStartAddress
     putStrLn $ "ssTotalLNECount: " ++ show ssTotalLNECount
     putStrLn $ "ssClosureCallCounter: " ++ show ssClosureCallCounter
     putStrLn $ "executed closure id count: " ++ show (Set.size ssExecutedClosureIds)
     putStrLn $ "call graph size: " ++ show (StrictMap.size . cgInterClosureCallGraph $ ssCallGraph)
-    putStrLn $ "binders to allocate on heap: " ++ show (Set.size escAnalysis)
-    putStrLn $ "binders to allocate on stack: " ++ show (Set.size canAllocOnStack) -- ++ "): " ++ show (Set.map binderUniqueName canAllocOnStack)
-    putStrLn $ "binders on stack escaped: " ++ show (Set.size escapedBinders) -- ++ "): " ++ show (Set.map binderUniqueName escapedBinders)
-    putStrLn $ "binders on heap didn't escape: " ++ show (Set.size onHeapDidn'tEscape) -- ++ "): " ++ show (Set.map binderUniqueName onHeapDidn'tEscape)
-    putStrLn $ "heap allocations: " ++ show heapAllocs ++ " (" ++ show heapAllocsBytes ++ " Bytes)"
+    putStrLn $ "binders to allocate on stack: " ++ show (Set.size allocOnStack) -- ++ "): " ++ show (Set.map binderUniqueName allocOnStack)
+    putStrLn $ "binders to allocate on heap: " ++ show (Set.size allocOnHeap)
+    putStrLn $ "can be allocated on stack: " ++ show (Set.size canAllocOnStack)
+    putStrLn $ "must be allocated on heap: " ++ show (Set.size mustAllocOnHeap)
+    putStrLn $ "binders on heap didn't escape: " ++ show (Set.size onHeapDidn'tEscape) ++ "(" ++ show (Set.size onHeapDidn'tEscape) ++ "): " ++ show onHeapDidn'tEscapeBytes
+    putStrLn $ "binders on stack escaped: " ++ show (Set.size onStackEscaped) ++ "): " ++ show (Set.map binderUniqueName onStackEscaped)
     printf     "stack allocations: %d (%d Bytes, %.2f%%)\n" stackAllocs stackAllocsBytes (100 * (fromIntegral stackAllocsBytes :: Double) / (fromIntegral stackAllocsBytes + fromIntegral heapAllocsBytes))
-    putStrLn $ "lower bound heap allocations: " ++ show minHeapAllocs ++ " (" ++ show minHeapAllocsBytes ++ " Bytes)"
+    putStrLn $ "heap allocations: " ++ show heapAllocs ++ " (" ++ show heapAllocsBytes ++ " Bytes)"
     printf     "upper bound stack allocations: %d (%d Bytes, %.2f%%)\n" maxStackAllocs maxStackAllocsBytes (100 * (fromIntegral maxStackAllocsBytes :: Double) / (fromIntegral maxStackAllocsBytes + fromIntegral minHeapAllocsBytes))
+    putStrLn $ "lower bound heap allocations: " ++ show minHeapAllocs ++ " (" ++ show minHeapAllocsBytes ++ " Bytes)"
     --putStrLn $ unlines $ [BS8.unpack $ binderUniqueName b | Id b <- Map.keys ssEnv]
     --print ssNextHeapAddr
     --print $ head $ Map.toList ssEnv

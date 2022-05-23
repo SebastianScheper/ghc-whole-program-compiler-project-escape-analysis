@@ -188,30 +188,37 @@ writeCallGraphSummary fname CallGraph{..} = do
 exportEscapeStats :: Set.Set Binder -> M ()
 exportEscapeStats escAnalysis = do
   StgState{..} <- get
-  let canAllocOnStack = ssBindersDefined `Set.difference` escAnalysis
-      onHeapDidn'tEscape = (ssBindersDefined `Set.difference` ssBindersEscaped) `Set.difference` canAllocOnStack
-      escapedBinders = ssBindersEscaped `Set.difference` escAnalysis
+  let allocOnStack = ssBindersDefined `Set.difference` escAnalysis
+      allocOnHeap = ssBindersDefined `Set.intersection` escAnalysis
+      canAllocOnStack = ssBindersDefined `Set.difference` ssBindersEscaped
+      mustAllocOnHeap = ssBindersEscaped
+      onHeapDidn'tEscape = canAllocOnStack `Set.difference` allocOnStack
+      onStackEscaped = mustAllocOnHeap `Set.difference` allocOnHeap
+
       (heapAllocBinders, stackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b escAnalysis) ssBinderAllocs
       (heapAllocs, heapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) heapAllocBinders
       (stackAllocs, stackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) stackAllocBinders
-
+    
       (minHeapAllocBinders, maxStackAllocBinders) = Map.partitionWithKey (\ b _ -> Set.member b ssBindersEscaped) ssBinderAllocs
-      (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
       (maxStackAllocs, maxStackAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) maxStackAllocBinders
+      (minHeapAllocs, minHeapAllocsBytes) = foldl (\ (nSum, bytesSum) (n, bytes) -> (nSum + n, bytesSum + bytes)) (0, 0) minHeapAllocBinders
+
   liftIO $ withFile (rtsProgName ssRtsSupport ++ "-escape-stats.tsv") WriteMode $ \ h -> do
     hPutStr h `mapM_` [takeBaseName (rtsProgName ssRtsSupport)
-        , "\t", show (Set.size escAnalysis)
+        , "\t", show (Set.size allocOnStack)
+        , "\t", show (Set.size allocOnHeap)
         , "\t", show (Set.size canAllocOnStack)
-        , "\t", show (Set.size escapedBinders)
+        , "\t", show (Set.size mustAllocOnHeap)
         , "\t", show (Set.size onHeapDidn'tEscape)
-        , "\t", show heapAllocs
-        , "\t", show heapAllocsBytes
+        , "\t", show (Set.size onStackEscaped)
         , "\t", show stackAllocs
         , "\t", show stackAllocsBytes
-        , "\t", show minHeapAllocs
-        , "\t", show minHeapAllocsBytes
+        , "\t", show heapAllocs
+        , "\t", show heapAllocsBytes
         , "\t", show maxStackAllocs
         , "\t", show maxStackAllocsBytes
+        , "\t", show minHeapAllocs
+        , "\t", show minHeapAllocsBytes
         , "\n"
       ]
 

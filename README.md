@@ -118,3 +118,29 @@ The `.modpak` and `.fullpak` files use Zstd compression method that was introduc
 The GHC-WPC tooling can handle Zstd zip files out of the box.  
 But if you'd like to unpack the `.modpak` and `.fullpak` files manually then you'll need an `unzip` version with Zstd support.  
 https://github.com/csabahruska/unzip-zstd
+
+# Escape Analysis
+Before running a program with the `external-stg-interpreter`, a static escape analysis is being performed which determines the set of escaping bindings.
+
+During runtime, we keep track of the amount of memory allocation of these bindings. This enables the evaluation of the effectiveness for a potential optimization that allocates non-escaping bindings on the stack. 
+
+We also determine the the access of the allocated closures relative to the lexical scope of their bindings. That way, we can determine the soundness of the escape analysis algorithm and identify potential opportunities for improvement.
+
+The data collected at runtime is being stored in a text file called `<prog-name>-escape-stats.tsv`.
+It contains the following values:
+
+1. Program Name
+2. Number of non-escaping bindings according to the escape analysis (can be allocated on the stack)
+3. Number of escaping bindings according to the escape analysis (must be allocated on the heap)
+4. Number of bindings whose instances never got accessed outside of the bindings lexical scope during runtime (Could have been allocated on the stack)
+5. Number of bindings whose instances got accessed outside of the bindings lexical scope during runtime (Could not have been allocated on the stack)
+6. Number of non-escaping bindings according to the escape analysis whose instances got accessed outside of the bindings lexical scope (false negatives)
+7. Number of escaping bindings according to the escape analysis whose instances never got accessed outside of the bindings lexical scope (false positives)
+8. Number of stack allocations due to the escape analysis
+9. Amount of stack-allocated memory in bytes due to the escape analysis
+10. Number of heap allocations due to the escape analysis
+11. Amount of heap-allocated memory in bytes due to the escape analysis
+12. Upper bound for the number of stack allocations due to the escape analysis based on the closure access during runtime
+13. Upper bound for the amount of stack-allocated memory in bytes due to the escape analysis based on the closure access during runtime
+14. Lower bound for the number of heap allocations due to the escape analysis based on the closure access during runtime
+15. Lower bound for the amount of heap-allocated memory in bytes due to the escape analysis based on the closure access during runtime
